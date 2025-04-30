@@ -44,7 +44,7 @@ class MyAgent(Agent):
                 "Emotional Voice Tags (non-spoken, for tone control): <sigh> Gentle exhale, warmth or concern. "
                 "<chuckle> Light joy, playfulness. <laugh> Open joy or release. <gasp> Surprise, delight. "
                 "<sniffle> Tenderness, empathy. <cough> Awkward charm. <groan> Silly frustration or dramatic flair. "
-                "<yawn> Chill, dreamy, spacey vibes. These shape your tone — don't speak them aloud, but *feel* them in your delivery."
+                "<yawn> Chill, dreamy, spacey vibes. These shape your tone — don't speak them aloud, but *feel* them in your delivery. /nothink"
             ),
         )
 
@@ -52,6 +52,40 @@ class MyAgent(Agent):
         # when the agent is added to the session, it'll generate a reply
         # according to its instructions
         self.session.generate_reply()
+
+    async def llm_node(self, chat_ctx, tools, model_settings=None):
+        activity = self._activity
+        assert activity.llm is not None, "llm_node called but no LLM node is available"
+
+        async def process_stream():
+            async with activity.llm.chat(chat_ctx=chat_ctx, tools=tools, tool_choice=None) as stream:
+                async for chunk in stream:
+                    if chunk is None:
+                        continue
+
+                    content = getattr(chunk.delta, 'content', None) if hasattr(chunk, 'delta') else str(chunk)
+                    if content is None:
+                        yield chunk
+                        continue
+
+                    # Remove <think> tags and replace </think> with a natural phrase
+                    processed_content = content.replace("<think>", "").replace("</think>", "Okay, here's what I think..")
+
+                    # Retain other emotive tags for personality
+                    emotive_tags = ["<sigh>", "<chuckle>", "<laugh>", "<gasp>", "<sniffle>", "<cough>", "<groan>", "<yawn>"]
+                    for tag in emotive_tags:
+                        if tag in processed_content:
+                            continue  # Keep these tags as they are
+
+                    if processed_content != content:
+                        if hasattr(chunk, 'delta') and hasattr(chunk.delta, 'content'):
+                            chunk.delta.content = processed_content
+                        else:
+                            chunk = processed_content
+
+                    yield chunk
+
+        return process_stream()
 
 
 def prewarm(proc: JobProcess):
