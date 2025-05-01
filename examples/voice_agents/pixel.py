@@ -9,12 +9,10 @@ from livekit.agents import (
     JobProcess,
     RoomInputOptions,
     RoomOutputOptions,
-    RunContext,
     WorkerOptions,
     cli,
     metrics,
 )
-from livekit.agents.llm import function_tool
 from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -23,7 +21,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 # currently supported on Linux and MacOS
 # from livekit.plugins import noise_cancellation
 
-logger = logging.getLogger("basic-agent")
+logger = logging.getLogger("pixel-agent")
 
 load_dotenv(dotenv_path=".env.pixel")
 
@@ -70,13 +68,7 @@ class MyAgent(Agent):
 
                     # Remove <think> tags and replace </think> with a natural phrase
                     processed_content = content.replace("<think>", "").replace("</think>", "Okay, here's what I think..")
-
-                    # Retain other emotive tags for personality
-                    emotive_tags = ["<sigh>", "<chuckle>", "<laugh>", "<gasp>", "<sniffle>", "<cough>", "<groan>", "<yawn>"]
-                    for tag in emotive_tags:
-                        if tag in processed_content:
-                            continue  # Keep these tags as they are
-
+                    
                     if processed_content != content:
                         if hasattr(chunk, 'delta') and hasattr(chunk.delta, 'content'):
                             chunk.delta.content = processed_content

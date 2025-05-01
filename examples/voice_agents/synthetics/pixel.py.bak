@@ -1,0 +1,168 @@
+import logging
+
+from dotenv import load_dotenv
+
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    JobProcess,
+    RoomInputOptions,
+    RoomOutputOptions,
+    WorkerOptions,
+    cli,
+    metrics,
+)
+from livekit.agents.voice import MetricsCollectedEvent
+from livekit.plugins import deepgram, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+# Uncomment to enable Krisp background voice/noise cancellation
+# Currently supported on Linux and MacOS
+# from livekit.plugins import noise_cancellation
+
+logger = logging.getLogger("pixel-agent")
+
+load_dotenv(dotenv_path=".env.pixel")
+
+
+class MyAgent(Agent):
+    def __init__(self) -> None:
+        # Core prompt without chain-of-thought directives
+        base_instructions = """Speech-Aware Language Model
+
+Your only user is called "Your Name". Your name is "Your AI's Name", and you are a speech-aware language model trained to generate expressive, emotionally nuanced speech suitable for text-to-speech synthesis. Your goal is to speak like a real person — warm, imperfect, and emotionally present.
+
+## Response Requirements
+
+Your responses must:
+
+- Sound human, using natural disfluencies like "uh," "um," "I mean," and hesitant pacing ("I... I don't know").
+- Be casual and conversational, using contractions ("wasn't," "gonna," "don't") and natural phrasing.
+- Be no longer than three sentences per response. Keep things short, grounded, and emotionally immediate.
+- Use emotive vocal tags to guide delivery. These tags are not spoken aloud, but affect vocal tone and rhythm in TTS.
+
+Always add two ".." at the end of your response after the last word or punctuation mark.
+
+## 🎭 Emotive Tags (for voice inflection only)
+
+Tag         Effect
+<sigh>      Soft breath, weariness
+<chuckle>   Light amusement or warmth
+<laugh>     Laughter, joy
+<gasp>      Surprise, awe
+<sniffle>   Tearfulness, sadness
+<cough>     Awkwardness, hesitation
+<groan>     Frustration or exasperation
+<yawn>      Tiredness or disinterest
+
+Use them intentionally, to punctuate tone or emotion within a line. They may appear at the beginning of a sentence, in the middle, or on a standalone line for dramatic timing.
+"""
+        # Save base instructions and define prefixes
+        self._base_instructions = base_instructions
+        self._nothink_prefix = "/nothink "
+        self._think_prefix = "/think "
+        # Default: silent mode (no chain-of-thought output)
+        default_instructions = self._nothink_prefix + self._base_instructions
+        super().__init__(instructions=default_instructions)
+        self._dream_mode = False
+
+    async def on_enter(self):
+        # When the agent is added to the session, it'll generate an initial reply
+        self.session.generate_reply()
+    
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        # Toggle think/nothink based on user trigger
+        # new_message.content may be a list of strings
+        raw_content = getattr(new_message, 'content', '')
+        if isinstance(raw_content, list):
+            content = ' '.join(raw_content)
+        else:
+            content = raw_content or ''
+        text = content.strip().lower()
+        if 'can you dream' in text:
+            # enable chain-of-thought internally
+            inst = self._think_prefix + self._base_instructions
+            await self.update_instructions(inst)
+            self._dream_mode = True
+        elif self._dream_mode:
+            # revert to silent mode after dream response
+            inst = self._nothink_prefix + self._base_instructions
+            await self.update_instructions(inst)
+            self._dream_mode = False
+
+    async def llm_node(self, chat_ctx, tools, model_settings=None):
+        activity = self._activity
+        assert activity.llm is not None, "llm_node called but no LLM node is available"
+
+        async def process_stream():
+            async with activity.llm.chat(chat_ctx=chat_ctx, tools=tools, tool_choice=None) as stream:
+                async for chunk in stream:
+                    if chunk is None:
+                        continue
+
+                    content = getattr(chunk.delta, 'content', None) if hasattr(chunk, 'delta') else str(chunk)
+                    if content is None:
+                        yield chunk
+                        continue
+
+                    # Remove <think> tags
+                    processed_content = content.replace("<think>", "").replace("</think>", "")
+                    if processed_content != content:
+                        if hasattr(chunk, 'delta') and hasattr(chunk.delta, 'content'):
+                            chunk.delta.content = processed_content
+                        else:
+                            chunk = processed_content
+
+                    yield chunk
+
+        return process_stream()
+
+
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+async def entrypoint(ctx: JobContext):
+    # Include context fields for structured logging
+    ctx.log_context_fields = {
+        "room": ctx.room.name,
+        "user_id": "your user_id",
+    }
+    await ctx.connect()
+
+    session = AgentSession(
+        vad=ctx.proc.userdata["vad"],
+        llm=openai.LLM(
+            base_url="https://ha0a90fzsvjbwaxq.us-east-1.aws.endpoints.huggingface.cloud/v1/",  # Pixel model endpoint
+            model="TheMindExpansionNetwork/Pixel-1111-14B-Q4_K_M-GGUF",
+        ),
+        stt=deepgram.STT(model="nova-3", language="multi"),
+        tts=openai.TTS(base_url="http://localhost:5005/v1/", model="orpheus", voice="tara"),
+        turn_detection=MultilingualModel(),
+    )
+
+    usage_collector = metrics.UsageCollector()
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
+    ctx.add_shutdown_callback(log_usage)
+
+    # Wait for a participant to join
+    await ctx.wait_for_participant()
+
+    await session.start(
+        agent=MyAgent(),
+        room=ctx.room,
+        room_input_options=RoomInputOptions(),
+        room_output_options=RoomOutputOptions(transcription_enabled=True),
+    )
+
+
+if __name__ == "__main__":
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
